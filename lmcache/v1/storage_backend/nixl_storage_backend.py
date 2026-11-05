@@ -1952,10 +1952,27 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         # For remaining keys, use the new batched_nixl_desc_exists method
         remaining_keys = keys[true_count:]
-        reg_list = [(0, 0, 0, self._format_object_key(key)) for key in remaining_keys]
 
-        # Use the agent's batched_nixl_desc_exists method
-        consecutive_hits = self.agent.batched_nixl_desc_exists(reg_list)
+        if self.agent.mem_type == "FILE":
+            # FILE backends (GDS/GDS_MT/POSIX): a bare object key handed to
+            # query_memory is looked up relative to the process cwd, not under
+            # nixl_path, so every batched lookup missed (0 hit tokens for a
+            # store full of files). Resolve the same way the single-key
+            # contains() does: os.path.exists under self.path, stopping at the
+            # first miss (2026-09-25 benchmark patch).
+            consecutive_hits = 0
+            for key in remaining_keys:
+                if not self.agent.nixl_desc_exists(
+                    self._format_object_key(key), self.path
+                ):
+                    break
+                consecutive_hits += 1
+        else:
+            reg_list = [
+                (0, 0, 0, self._format_object_key(key)) for key in remaining_keys
+            ]
+            # Use the agent's batched_nixl_desc_exists method
+            consecutive_hits = self.agent.batched_nixl_desc_exists(reg_list)
 
         # Update cache for the hits and return total count
         for i in range(consecutive_hits):
