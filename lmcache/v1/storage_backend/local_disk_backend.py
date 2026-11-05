@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -33,6 +34,16 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+# Cross-restart persistence (benchmark-fairness patch, 2026-07-30; journal since
+# 2026-09-28): the key->file index lives only in memory upstream, so KV files
+# written before a server restart are invisible after it. Every new insert
+# appends one JSON line to a journal next to the cache files; __init__ replays
+# it. One O(1) append per insert, outside disk_lock: the first version rewrote
+# and fsynced the whole index under disk_lock on every insert, which taxed this
+# backend alone whenever a measured phase stored. Wiping the cache dir wipes the
+# journal too.
+INDEX_FILENAME = ".lmcache_disk_index.jsonl"
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -181,6 +192,122 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
+        # Cross-restart persistence (see INDEX_FILENAME). Last step of __init__:
+        # the replay needs dict / policy / stats set up.
+        self._index_path = os.path.join(self.path, INDEX_FILENAME)
+        self._index_lock = threading.Lock()
+        self._load_persistent_index()
+
+    def _load_persistent_index(self) -> None:
+        """Replay the journal of the previous process into self.dict.
+
+        Entries whose backing file is missing or has another size (evicted,
+        partly written) and lines that do not parse (torn last append) are
+        skipped. Any failure degrades to the upstream behavior (start empty);
+        nothing is raised out of __init__.
+        """
+        if not os.path.exists(self._index_path):
+            return
+        restored = skipped = 0
+        try:
+            with open(self._index_path, "r") as f:
+                lines = f.readlines()
+            with self.disk_lock:
+                for line in lines:
+                    try:
+                        e = json.loads(line)
+                        if os.path.getsize(e["path"]) != int(e["file_bytes"]):
+                            skipped += 1
+                            continue
+                        key = CacheEngineKey.from_string(e["key"])
+                        if key in self.dict:
+                            continue
+                        shape = (
+                            torch.Size(e["shape"])
+                            if e.get("shape") is not None
+                            else None
+                        )
+                        dtype = (
+                            getattr(torch, e["dtype"].split(".")[-1])
+                            if e.get("dtype")
+                            else None
+                        )
+                        fmt = (
+                            MemoryFormat(e["fmt"])
+                            if e.get("fmt") is not None
+                            else None
+                        )
+                        cached_positions = (
+                            torch.tensor(e["cached_positions"])
+                            if e.get("cached_positions") is not None
+                            else None
+                        )
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                        skipped += 1
+                        continue
+                    # Mirror the live put flow: policy bookkeeping, then insert.
+                    # Journal order == insertion order == LRU recency order.
+                    self.cache_policy.update_on_put(key)
+                    self.dict[key] = DiskCacheMetadata(
+                        e["path"],
+                        int(e["size"]),
+                        shape,
+                        dtype,
+                        cached_positions,
+                        fmt,
+                        0,
+                    )
+                    self.current_cache_size += int(e["size"])
+                    self.usage += int(e["size"])
+                    restored += 1
+            self.stats_monitor.update_local_storage_usage(self.usage)
+            logger.info(
+                "Restored %d disk-cache entries from %s (%d skipped)",
+                restored,
+                self._index_path,
+                skipped,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to load persistent disk index %s: %s — starting empty",
+                self._index_path,
+                e,
+            )
+
+    def _append_persistent_index(
+        self,
+        key: CacheEngineKey,
+        path: str,
+        size: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Optional[torch.Tensor],
+    ) -> None:
+        """Append one entry to the journal (called once per new insert_key,
+        after the chunk file is written). Never raises."""
+        try:
+            entry = {
+                "key": key.to_string(),
+                "path": path,
+                "size": int(size),
+                "file_bytes": int(os.path.getsize(path)),
+                "shape": list(shape) if shape is not None else None,
+                "dtype": str(dtype) if dtype is not None else None,
+                "fmt": int(fmt.value) if fmt is not None else None,
+                "cached_positions": (
+                    cached_positions.tolist() if cached_positions is not None else None
+                ),
+            }
+            line = json.dumps(entry) + "\n"
+            with self._index_lock:
+                with open(self._index_path, "a") as f:
+                    f.write(line)
+        except Exception as e:
+            logger.warning(
+                "Failed to persist disk index entry to %s: %s", self._index_path, e
+            )
+
     def __str__(self) -> str:
         return "LocalDiskBackend"
 
@@ -299,6 +426,12 @@ class LocalDiskBackend(StorageBackendInterface):
             self.batched_msg_sender.add_kv_op(
                 op_type=OpType.ADMIT,
                 key=key.chunk_hash,
+            )
+
+        # Cross-restart persistence: journal the new entry (see INDEX_FILENAME).
+        if not has_stored:
+            self._append_persistent_index(
+                key, path, size, shape, dtype, fmt, cached_positions
             )
 
     def submit_put_task(
@@ -673,3 +806,15 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+        # Worker drained (shutdown wait=True): every insert has appended its
+        # entry. Make the journal durable for the next boot.
+        try:
+            with self._index_lock:
+                if os.path.exists(self._index_path):
+                    fd = os.open(self._index_path, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+        except OSError as e:
+            logger.warning("Could not fsync %s: %s", self._index_path, e)
