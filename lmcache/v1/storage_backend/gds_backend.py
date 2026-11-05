@@ -33,6 +33,7 @@ from lmcache.v1.memory_management import (
     HipFileMemoryAllocator,
     MemoryFormat,
     MemoryObj,
+    OpenDSMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
@@ -288,6 +289,7 @@ class GdsBackend(AllocatorBackendInterface):
 
                 self.cudart = None
                 self.gds_module = cufile
+                self._gds_file_cls = cufile.CuFile
                 self._gds_driver = self.gds_module.CuFileDriver()
             elif self.gds_backend == "hipfile":
                 # HACK: hipfile import may be buggy on some hardware
@@ -297,15 +299,36 @@ class GdsBackend(AllocatorBackendInterface):
 
                 self.cudart = None
                 self.gds_module = hipfile_shim
+                self._gds_file_cls = hipfile_shim.CuFile
                 self._gds_driver = self.gds_module.CuFileDriver()
+            elif self.gds_backend == "opends":
+                # OpenDS (vendor-neutral direct storage). The provider .so is
+                # selected at import via OPENDS_BACKEND/OPENDS_LIBRARY (gds =
+                # cuFile passthrough; aisio = userspace NVMe over qublk/HOMI).
+                # OpenDSFile mirrors cufile.CuFile's read/write signatures;
+                # there is no driver object — the driver opens on the first
+                # register_buffer/OpenDSFile and closes when the last releases.
+                # Third Party
+                import opends
+
+                self.cudart = None
+                self.gds_module = opends
+                self._gds_file_cls = opends.OpenDSFile
+                self._gds_driver = None
             else:
                 raise ValueError(f"Unsupported gds_backend '{self.gds_backend}'")
         else:
             logger.info("GDS disabled, using POSIX fallback")
             self.gds_module = None
+            self._gds_file_cls = None
             self.cudart = ctypes.CDLL("libcudart.so")
 
         self.use_direct_io = False
+        if self.gds_backend == "opends":
+            # None = defer to the provider's own requirement (the opends gds
+            # passthrough needs O_DIRECT, aisio/ref do not). An explicit
+            # use_direct_io in extra_config below still overrides this.
+            self.use_direct_io = None
 
         # Values for retrying allocations and loads in case of failures potentially
         # due to memory pressure
@@ -961,7 +984,7 @@ class GdsBackend(AllocatorBackendInterface):
             with open(tmp_path, "wb") as f:
                 f.write(metadata)
             if self.gds_module:
-                with self.gds_module.CuFile(
+                with self._gds_file_cls(
                     tmp_path, "r+", use_direct_io=self.use_direct_io
                 ) as f:
                     f.write(
@@ -1010,7 +1033,7 @@ class GdsBackend(AllocatorBackendInterface):
         """Read data from disk into a GPU buffer"""
         try:
             if self.gds_module:
-                with self.gds_module.CuFile(
+                with self._gds_file_cls(
                     gds_path, "r", use_direct_io=self.use_direct_io
                 ) as f:
                     return f.read(
@@ -1083,13 +1106,16 @@ class GdsBackend(AllocatorBackendInterface):
 
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
-    ) -> Union[CuFileMemoryAllocator, HipFileMemoryAllocator]:
+    ) -> Union[
+        CuFileMemoryAllocator, HipFileMemoryAllocator, OpenDSMemoryAllocator
+    ]:
         assert config.gds_buffer_size is not None
-        allocator_cls = (
-            HipFileMemoryAllocator
-            if self.gds_backend == "hipfile"
-            else CuFileMemoryAllocator
-        )
+        if self.gds_backend == "hipfile":
+            allocator_cls: type = HipFileMemoryAllocator
+        elif self.gds_backend == "opends":
+            allocator_cls = OpenDSMemoryAllocator
+        else:
+            allocator_cls = CuFileMemoryAllocator
         return allocator_cls(config.gds_buffer_size * 1024**2)
 
     def allocate(

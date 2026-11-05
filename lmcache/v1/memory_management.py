@@ -2680,6 +2680,37 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
         return "CuFileMemoryAllocator"
 
 
+class OpenDSMemoryAllocator(GPUMemoryAllocator):
+    def __init__(self, size: int, device=None):
+        # Lazy import mirrors the cufile/hipfile allocators. opends resolves
+        # its provider .so at import via OPENDS_BACKEND / OPENDS_LIBRARY.
+        # Third Party
+        import opends
+
+        self._opends = opends
+        if device is None:
+            if torch.cuda.is_available():
+                device = f"cuda:{torch.cuda.current_device()}"
+            else:
+                device = "cpu:0"
+        super().__init__(size, device, align_bytes=4096)
+        self.base_pointer = self.tensor.data_ptr()
+        # Pins the buffer for DMA and opens the OpenDS driver (which installs
+        # the SIGTERM/SIGINT cleanup backstop that releases the GPU dma-buf).
+        opends.register_buffer(self.base_pointer, size)
+
+    def __del__(self):
+        # Guard partially-constructed instances: __del__ runs even when
+        # __init__ raised before _opends/base_pointer were assigned.
+        opends = getattr(self, "_opends", None)
+        base = getattr(self, "base_pointer", None)
+        if opends is not None and base is not None:
+            opends.deregister_buffer(base)
+
+    def __str__(self):
+        return "OpenDSMemoryAllocator"
+
+
 class HipFileMemoryAllocator(GPUMemoryAllocator):
     def __init__(self, size: int, device=None):
         # HACK: hipfile import is placed here to avoid import errors on
