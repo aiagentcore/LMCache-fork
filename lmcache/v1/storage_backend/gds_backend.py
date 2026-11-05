@@ -895,6 +895,25 @@ class GdsBackend(AllocatorBackendInterface):
             return None
         return Future()
 
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+        transfer_spec: Any = None,
+    ) -> List[MemoryObj]:
+        # opends-benchmarks: SGLang's in-process layerwise retrieve calls this
+        # per layer and blocks on the result; stock 0.4.7 inherits the
+        # NotImplementedError stub. The existing GPU read (cuFile or the
+        # OpenDS provider) moves every chunk NVMe -> VRAM.
+        mem_objs = self.batched_get_blocking(list(keys))
+        missing = [k for k, m in zip(keys, mem_objs) if m is None]
+        assert not missing, (
+            "GdsBackend.batched_get_non_blocking: "
+            f"{len(missing)}/{len(keys)} key(s) missing from the GDS store after "
+            "lookup/pin; layerwise retrieve expects every requested key present."
+        )
+        return mem_objs
+
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
