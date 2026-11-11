@@ -10,19 +10,28 @@ between that buffer and the slab. No POSIX fallback -- if cuFile is
 unavailable, construction fails loudly. The slab is cleared on init, so it
 does not survive a restart (GDS L1 is treated like DRAM).
 
-Provider selection (OpenDS port, 2026-09-15): LMCACHE_MP_GDS_PROVIDER=cufile
-(default) keeps the stream-ordered cuFile path; LMCACHE_MP_GDS_PROVIDER=opends
-routes the slab through the vendor-neutral OpenDS binding instead
-(OPENDS_BACKEND/OPENDS_LIBRARY pick libopends_gds.so = cuFile passthrough or
-libopends_aisio.so = userspace NVMe over HOMI/qublk). The OpenDS binding is
-synchronous, so each transfer synchronizes the current stream first and
-completes before returning; ordering for later stream work is preserved.
+Two independent settings choose how bytes move between the slab and GPU memory:
+
+LMCACHE_MP_GDS_PROVIDER, the library: ``cufile`` (default, libcufile through
+this package's ctypes wrapper) or ``opends`` (the OpenDS binding;
+OPENDS_BACKEND/OPENDS_LIBRARY pick the provider library, cuFile passthrough or
+aisio).
+
+LMCACHE_MP_GDS_SUBMIT, the submission: ``stream`` (default: the transfer is
+enqueued on the current CUDA stream and the call returns, cuFileReadAsync /
+opends read_stream) or ``sync`` (the current stream is synchronized, then one
+blocking transfer under a lock, cuFileRead / opends read_sync).
+
+Both libraries implement both submissions through the same code below, so a
+comparison of two libraries holds the submission fixed and a comparison of two
+submissions holds the library fixed.
 """
 
 # Standard
 from dataclasses import dataclass, field
 from typing import Optional
 import bisect
+import ctypes
 import enum
 import functools
 import os
@@ -44,6 +53,13 @@ logger = init_logger(__name__)
 _PROVIDER = os.environ.get("LMCACHE_MP_GDS_PROVIDER", "cufile").strip().lower()
 if _PROVIDER not in ("cufile", "opends"):
     raise ValueError(f"LMCACHE_MP_GDS_PROVIDER={_PROVIDER!r}: want cufile|opends")
+# stream | sync -- how a transfer is submitted (see the module docstring)
+_SUBMIT = os.environ.get("LMCACHE_MP_GDS_SUBMIT", "stream").strip().lower()
+if _SUBMIT not in ("stream", "sync"):
+    raise ValueError(f"LMCACHE_MP_GDS_SUBMIT={_SUBMIT!r}: want stream|sync")
+# cuFileStreamRegister flags of the cufile wrapper (fixed size and offsets),
+# given to the OpenDS stream registration too
+_STREAM_FLAGS = 0x7
 
 _SLAB_FILENAME = "lmcache_gds_slab.bin"
 _CUFILE_ALIGNMENT = 4096
@@ -73,10 +89,8 @@ class _StreamSubmissions:
     event only orders work on its own stream.
     """
 
-    uncommitted: list[ca.Submission] = field(default_factory=list)
-    inflight: list[tuple[torch.Event, list[ca.Submission]]] = field(
-        default_factory=list
-    )
+    uncommitted: list = field(default_factory=list)
+    inflight: list[tuple[torch.Event, list]] = field(default_factory=list)
     ops_since_checkpoint: int = 0
 
 
@@ -110,16 +124,19 @@ class GDSContext:
         self._registered_streams: set[int] = set()  # maintained for close()
         # OpenDS provider state (LMCACHE_MP_GDS_PROVIDER=opends)
         self._opends = None
+        self._opends_driver = None
         self._opends_file = None
         # slab transfer accounting, both providers: [count, bytes] per direction
         self._xfer = {"read": [0, 0], "write": [0, 0]}
+        self._short = 0  # stream transfers found short when their batch drained
         self._xfer_lock = threading.Lock()
         self._trace = os.environ.get("LMCACHE_MP_GDS_TRACE", "0") == "1"
-        # Serializes OpenDS I/O: libopends_aisio's synchronous submit ring is
-        # single-producer, and the MP daemon runs STORE/RETRIEVE handlers on an
-        # affinity thread pool (one worker per GPU instance), so two instances
-        # would otherwise race on it. Uncontended with one instance.
-        self._opends_io_lock = threading.Lock()
+        # Serializes sync-submission I/O for both providers: libopends_aisio's
+        # synchronous submit ring is single-producer, and the MP daemon runs
+        # STORE/RETRIEVE handlers on an affinity thread pool (one worker per GPU
+        # instance), so two instances would otherwise race on it. Uncontended
+        # with one instance.
+        self._sync_io_lock = threading.Lock()
 
     def initialize(self, config: GdsL1Config) -> None:
         """Create + clear the slab and register it with cuFile.
@@ -163,8 +180,11 @@ class GDSContext:
         buf = buffer.view(torch.uint8)
         nbytes = buf.numel()
         with self._registry_lock:
-            if _PROVIDER == "cufile" and raw_stream not in self._registered_streams:
-                ca.register_stream(raw_stream)
+            if _SUBMIT == "stream" and raw_stream not in self._registered_streams:
+                if _PROVIDER == "opends":
+                    self._opends.register_stream(raw_stream, _STREAM_FLAGS)
+                else:
+                    ca.register_stream(raw_stream)
                 self._registered_streams.add(raw_stream)
             for start in range(0, nbytes, _MAX_CUFILE_REGION):
                 self._register_region_locked(
@@ -190,9 +210,9 @@ class GDSContext:
                 self._deregister_region_locked(
                     buf[start : min(start + _MAX_CUFILE_REGION, nbytes)]
                 )
-            if _PROVIDER == "cufile" and raw_stream in self._registered_streams:
+            if raw_stream in self._registered_streams:
                 try:
-                    ca.deregister_stream(raw_stream)
+                    self._deregister_stream(raw_stream)
                 except Exception as e:
                     logger.warning(
                         "GDSContext.deregister_gpu_buffer: deregister_stream: %s", e
@@ -236,10 +256,13 @@ class GDSContext:
     def close(self) -> None:
         """Sync the stream, deregister cuFile state, and close the slab handle."""
         logger.info(
-            "GDSContext: closing (%s): slab reads %d (%.1f MiB), writes %d (%.1f MiB)",
+            "GDSContext: closing (provider=%s submit=%s): slab reads %d (%.1f MiB), "
+            "writes %d (%.1f MiB), short transfers %d",
             _PROVIDER,
+            _SUBMIT,
             self._xfer["read"][0], self._xfer["read"][1] / (1 << 20),
             self._xfer["write"][0], self._xfer["write"][1] / (1 << 20),
+            self._short,
         )
         if self._buffers:
             torch_dev.synchronize(device=self._buffers[0].device)
@@ -262,7 +285,7 @@ class GDSContext:
             self._nbytes.clear()
             for raw_stream in list(self._registered_streams):
                 try:
-                    ca.deregister_stream(raw_stream)
+                    self._deregister_stream(raw_stream)
                 except Exception as e:
                     logger.warning("GDSContext.close: deregister_stream: %s", e)
             self._registered_streams.clear()
@@ -278,6 +301,12 @@ class GDSContext:
             except Exception as e:
                 logger.warning("GDSContext.close: OpenDS slab close failed: %s", e)
             self._opends_file = None
+        if self._opends_driver is not None:
+            try:
+                self._opends_driver.close()
+            except Exception as e:
+                logger.warning("GDSContext.close: OpenDS driver close failed: %s", e)
+            self._opends_driver = None
 
     # --- Internal -----------------------------------------------------
 
@@ -300,19 +329,30 @@ class GDSContext:
             import opends
 
             self._opends = opends
+            # OpenDS next needs an open Driver before any file or buffer call
+            # (as cuFileDriverOpen); the PR #18 binding opens it on first use
+            # and has no Driver class.
+            if hasattr(opends, "Driver"):
+                self._opends_driver = opends.Driver()
+            if _SUBMIT == "stream" and not hasattr(opends.OpenDSFile, "read_stream"):
+                raise RuntimeError(
+                    "this OpenDS binding has no stream I/O (read_stream); "
+                    "set LMCACHE_MP_GDS_SUBMIT=sync"
+                )
             # r+ = O_RDWR on the existing (fallocated) slab; the binding adds
             # O_DIRECT itself when use_direct_io is set and registers the file
-            # handle with the provider (driver opened on first use).
+            # handle with the provider.
             self._opends_file = opends.OpenDSFile(
                 self._slab_path, "r+", use_direct_io=use_direct_io
             )
-            _cdll = getattr(opends, "_cdll", None)
+            _cdll = getattr(opends, "cdll", None) or getattr(opends, "_cdll", None)
             logger.info(
-                "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), OpenDS "
-                "handle registered (backend=%s, OPENDS_LIBRARY=%s, thread=%s)",
+                "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), "
+                "provider=opends submit=%s (backend=%s, OPENDS_LIBRARY=%s, thread=%s)",
                 self._slab_path,
                 self._slab_size / (1 << 30),
                 use_direct_io,
+                _SUBMIT,
                 getattr(_cdll, "BACKEND", os.environ.get("OPENDS_BACKEND", "?")),
                 os.environ.get("OPENDS_LIBRARY", "<binding default>"),
                 threading.current_thread().name,
@@ -334,11 +374,12 @@ class GDSContext:
             fd, handle, self._slab_path, writable=True
         )
         logger.info(
-            "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), cuFile "
-            "handle registered",
+            "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), "
+            "provider=cufile submit=%s",
             self._slab_path,
             self._slab_size / (1 << 30),
             use_direct_io,
+            _SUBMIT,
         )
 
     def _register_region_locked(self, buffer: torch.Tensor) -> None:
@@ -403,60 +444,94 @@ class GDSContext:
     def _slab_read(
         self, slab_offset: int, size: int, dev_offset: int, buf_base: int
     ) -> None:
-        """Submit one ``cuFileReadAsync`` against the slab handle (stream-ordered)."""
-        if _PROVIDER == "opends":
-            self._opends_sync_io(False, slab_offset, size, dev_offset, buf_base)
-            return
-        if self._slab_handle is None:
-            raise RuntimeError("GDSContext._slab_read: slab handle not open")
-        stream_handle = torch_dev.current_stream().cuda_stream
-        sub = self._slab_handle.read_async(
-            buf_base, size, slab_offset, dev_offset, stream_handle
-        )
-        self._record_submission(sub)
-        self._account("read", size, slab_offset)
+        """Move ``size`` bytes slab -> registered region (see ``_slab_io``)."""
+        self._slab_io(False, slab_offset, size, dev_offset, buf_base)
 
     def _slab_write(
         self, slab_offset: int, size: int, dev_offset: int, buf_base: int
     ) -> None:
-        """Submit one ``cuFileWriteAsync`` against the slab handle (stream-ordered)."""
-        if _PROVIDER == "opends":
-            self._opends_sync_io(True, slab_offset, size, dev_offset, buf_base)
-            return
-        if self._slab_handle is None:
-            raise RuntimeError("GDSContext._slab_write: slab handle not open")
-        stream_handle = torch_dev.current_stream().cuda_stream
-        sub = self._slab_handle.write_async(
-            buf_base, size, slab_offset, dev_offset, stream_handle
-        )
-        self._record_submission(sub)
-        self._account("write", size, slab_offset)
+        """Move ``size`` bytes registered region -> slab (see ``_slab_io``)."""
+        self._slab_io(True, slab_offset, size, dev_offset, buf_base)
 
-    def _opends_sync_io(
+    def _slab_io(
         self, write: bool, slab_offset: int, size: int, dev_offset: int, buf_base: int
     ) -> None:
-        """One synchronous OpenDS transfer between a registered region and the slab.
+        """One transfer between ``buf_base + dev_offset`` and ``slab_offset``.
 
-        The binding has no stream-ordered submission, so: wait for the current
-        stream (a WRITE must see the producer's data; a READ's consumers are
-        enqueued after we return), then move ``size`` bytes at
-        ``buf_base + dev_offset`` <-> ``slab_offset``.
+        ``stream`` submission enqueues it on the current CUDA stream
+        (``cuFileReadAsync`` / ``cuFileWriteAsync``, or the OpenDS stream calls)
+        and returns; ``sync`` submission completes it before returning.
         """
-        if self._opends_file is None:
-            raise RuntimeError("GDSContext: OpenDS slab file not open")
+        kind = "write" if write else "read"
+        if _SUBMIT == "sync":
+            self._sync_io(write, slab_offset, size, dev_offset, buf_base)
+        else:
+            raw_stream = torch_dev.current_stream().cuda_stream
+            if _PROVIDER == "opends":
+                if self._opends_file is None:
+                    raise RuntimeError("GDSContext: OpenDS slab file not open")
+                f = self._opends_file
+                op = f.write_stream if write else f.read_stream
+                sub = op(int(buf_base), size, slab_offset, dev_offset, raw_stream)
+            else:
+                if self._slab_handle is None:
+                    raise RuntimeError("GDSContext: slab handle not open")
+                h = self._slab_handle
+                op = h.write_async if write else h.read_async
+                sub = op(buf_base, size, slab_offset, dev_offset, raw_stream)
+            self._record_submission(sub)
+        self._account(kind, size, slab_offset)
+
+    def _sync_io(
+        self, write: bool, slab_offset: int, size: int, dev_offset: int, buf_base: int
+    ) -> None:
+        """One blocking transfer, the same steps for both providers.
+
+        Wait for the current stream (a WRITE must see the producer's data; a
+        READ's consumers are enqueued after this returns), then move the bytes
+        with ``cuFileRead`` / ``cuFileWrite`` or the OpenDS sync calls.
+        """
         kind = "write" if write else "read"
         # Only this thread enqueues on its current stream, so after the sync the
         # buffer contents stay committed while we wait for the I/O lock.
         torch_dev.current_stream().synchronize()
-        op = self._opends_file.write if write else self._opends_file.read
-        with self._opends_io_lock:
-            done = op(int(buf_base), size, slab_offset, dev_offset)
+        with self._sync_io_lock:
+            if _PROVIDER == "opends":
+                if self._opends_file is None:
+                    raise RuntimeError("GDSContext: OpenDS slab file not open")
+                f = self._opends_file
+                # read_sync / write_sync on OpenDS next, read / write on PR #18
+                if write:
+                    op = getattr(f, "write_sync", None) or f.write
+                else:
+                    op = getattr(f, "read_sync", None) or f.read
+                done = op(int(buf_base), size, slab_offset, dev_offset)
+            else:
+                if self._slab_handle is None:
+                    raise RuntimeError("GDSContext: slab handle not open")
+                # Third Party
+                from cufile.bindings import cuFileRead, cuFileWrite
+
+                op = cuFileWrite if write else cuFileRead
+                done = op(
+                    self._slab_handle._handle,
+                    ctypes.c_void_p(buf_base),
+                    size,
+                    slab_offset,
+                    dev_offset,
+                )
         if done != size:
             raise RuntimeError(
-                f"GDSContext: OpenDS {kind} moved {done} of {size} bytes "
+                f"GDSContext: {_PROVIDER} sync {kind} moved {done} of {size} bytes "
                 f"(slab_offset={slab_offset}, dev_offset={dev_offset})"
             )
-        self._account(kind, size, slab_offset)
+
+    def _deregister_stream(self, raw_stream: int) -> None:
+        """Reverse of the stream registration in ``register_gpu_buffer``."""
+        if _PROVIDER == "opends":
+            self._opends.deregister_stream(raw_stream)
+        else:
+            ca.deregister_stream(raw_stream)
 
     def _account(self, kind: str, size: int, slab_offset: int) -> None:
         """Count one slab transfer; log the first of each kind (and all if traced)."""
@@ -467,12 +542,13 @@ class GDSContext:
             n = c[0]
         if n == 1 or self._trace:
             logger.info(
-                "GDSContext: slab %s #%d %d bytes @ slab_offset=%d via %s",
-                kind, n, size, slab_offset, _PROVIDER,
+                "GDSContext: slab %s #%d %d bytes @ slab_offset=%d via %s (%s)",
+                kind, n, size, slab_offset, _PROVIDER, _SUBMIT,
             )
 
-    def _record_submission(self, sub: "ca.Submission") -> None:
-        """Track an in-flight submission so its ctypes storage outlives the DMA.
+    def _record_submission(self, sub) -> None:
+        """Track an in-flight submission (a cufile ``Submission`` or an OpenDS
+        ``StreamOp``) so its ctypes storage outlives the DMA.
 
         Accumulated per (current) stream; every ``_SUBMISSION_CHECKPOINT_EVERY``
         ops a CUDA event is recorded and completed batches are released.
@@ -501,9 +577,34 @@ class GDSContext:
             st.inflight.append((event, st.uncommitted))
             st.uncommitted = []
         st.ops_since_checkpoint = 0
-        st.inflight = [
-            (event, subs) for (event, subs) in st.inflight if not event.query()
-        ]
+        pending = []
+        for event, subs in st.inflight:
+            if event.query():
+                self._check_drained(subs)
+            else:
+                pending.append((event, subs))
+        st.inflight = pending
+
+    def _check_drained(self, subs: list) -> None:
+        """Compare the byte count of completed stream transfers with their size.
+
+        The data of a short transfer has already been consumed by the copy
+        kernel queued behind it, so this can only report: one ERROR line per
+        short transfer, and the total at close. Batches still in flight when a
+        stream is deregistered are not checked.
+        """
+        for sub in subs:
+            want = sub._size.value
+            if isinstance(sub, ca.Submission):
+                got = sub.bytes_done
+            else:
+                got = sub._bytes.value
+            if got != want:
+                self._short += 1
+                logger.error(
+                    "GDSContext: short slab transfer: %d of %d bytes via %s (%s)",
+                    got, want, _PROVIDER, _SUBMIT,
+                )
 
 
 @functools.cache
