@@ -69,6 +69,10 @@ _MAX_CUFILE_REGION = 16 * 1024 * 1024
 # cuFile submissions to accumulate before recording a completion event and
 # draining finished ones (keeps the live submission set bounded).
 _SUBMISSION_CHECKPOINT_EVERY = 64
+# Seconds between sweeps that check the stream transfers no later checkpoint
+# would reach (the tail of a burst): every stream transfer gets its byte count
+# compared, as every sync transfer does.
+_SWEEP_INTERVAL_SEC = 1.0
 
 
 class SlabDirection(enum.Enum):
@@ -92,6 +96,7 @@ class _StreamSubmissions:
     uncommitted: list = field(default_factory=list)
     inflight: list[tuple[torch.Event, list]] = field(default_factory=list)
     ops_since_checkpoint: int = 0
+    stream: Optional["torch.Stream"] = None  # for the sweep's event
 
 
 class GDSContext:
@@ -129,6 +134,13 @@ class GDSContext:
         # slab transfer accounting, both providers: [count, bytes] per direction
         self._xfer = {"read": [0, 0], "write": [0, 0]}
         self._short = 0  # stream transfers found short when their batch drained
+        # stream transfers submitted / checked after completion, and the checked
+        # count at the last "stream transfers checked" log line
+        self._stream_submitted = 0
+        self._stream_checked = 0
+        self._stream_reported = 0
+        self._sweep_stop = threading.Event()
+        self._sweeper: Optional[threading.Thread] = None
         self._xfer_lock = threading.Lock()
         self._trace = os.environ.get("LMCACHE_MP_GDS_TRACE", "0") == "1"
         # Serializes sync-submission I/O for both providers: libopends_aisio's
@@ -162,6 +174,11 @@ class GDSContext:
 
         self._open_and_register_slab(config.use_direct_io)
         self.initialized = True
+        if _SUBMIT == "stream":
+            self._sweeper = threading.Thread(
+                target=self._sweep_loop, name="gds-slab-sweep", daemon=True
+            )
+            self._sweeper.start()
 
     # --- Public API ---------------------------------------------------
 
@@ -218,9 +235,15 @@ class GDSContext:
                         "GDSContext.deregister_gpu_buffer: deregister_stream: %s", e
                     )
                 self._registered_streams.discard(raw_stream)
-        # Stream is synced above, so its submissions' DMAs are done -- drop them.
+        # Stream is synced above, so its submissions' DMAs are done: check their
+        # byte counts, then drop them.
         with self._submissions_lock:
-            self._submissions.pop(raw_stream, None)
+            st = self._submissions.pop(raw_stream, None)
+            if st is not None:
+                self._check_drained(st.uncommitted)
+                for _event, subs in st.inflight:
+                    self._check_drained(subs)
+                self._report_checked_locked()
 
     def transfer_async(
         self,
@@ -255,6 +278,16 @@ class GDSContext:
 
     def close(self) -> None:
         """Sync the stream, deregister cuFile state, and close the slab handle."""
+        self._sweep_stop.set()
+        if self._buffers:
+            torch_dev.synchronize(device=self._buffers[0].device)
+        with self._submissions_lock:
+            for st in self._submissions.values():
+                self._check_drained(st.uncommitted)
+                for _event, subs in st.inflight:
+                    self._check_drained(subs)
+            self._submissions.clear()
+            self._report_checked_locked()
         logger.info(
             "GDSContext: closing (provider=%s submit=%s): slab reads %d (%.1f MiB), "
             "writes %d (%.1f MiB), short transfers %d",
@@ -264,10 +297,6 @@ class GDSContext:
             self._xfer["write"][0], self._xfer["write"][1] / (1 << 20),
             self._short,
         )
-        if self._buffers:
-            torch_dev.synchronize(device=self._buffers[0].device)
-        with self._submissions_lock:
-            self._submissions.clear()
         # Deregister any regions/streams still live (per-instance teardown via
         # ``deregister_gpu_buffer`` normally clears these first; this is the
         # shutdown sweep for anything left).
@@ -559,7 +588,9 @@ class GDSContext:
             st = self._submissions.get(raw_stream)
             if st is None:
                 st = self._submissions[raw_stream] = _StreamSubmissions()
+                st.stream = stream
             st.uncommitted.append(sub)
+            self._stream_submitted += 1
             st.ops_since_checkpoint += 1
             if st.ops_since_checkpoint >= _SUBMISSION_CHECKPOINT_EVERY:
                 self._checkpoint_submissions_locked(st, stream)
@@ -590,9 +621,9 @@ class GDSContext:
 
         The data of a short transfer has already been consumed by the copy
         kernel queued behind it, so this can only report: one ERROR line per
-        short transfer, and the total at close. Batches still in flight when a
-        stream is deregistered are not checked.
+        short transfer, and the total at close. Hold ``self._submissions_lock``.
         """
+        self._stream_checked += len(subs)
         for sub in subs:
             want = sub._size.value
             if isinstance(sub, ca.Submission):
@@ -605,6 +636,36 @@ class GDSContext:
                     "GDSContext: short slab transfer: %d of %d bytes via %s (%s)",
                     got, want, _PROVIDER, _SUBMIT,
                 )
+
+    def _report_checked_locked(self) -> None:
+        """One INFO line when every submitted stream transfer has been checked
+        and some were since the last line. Hold ``self._submissions_lock``."""
+        if (
+            self._stream_checked == self._stream_submitted
+            and self._stream_checked != self._stream_reported
+        ):
+            self._stream_reported = self._stream_checked
+            logger.info(
+                "GDSContext: stream transfers checked: %d of %d submitted, "
+                "%d short (provider=%s)",
+                self._stream_checked, self._stream_submitted, self._short,
+                _PROVIDER,
+            )
+
+    def _sweep_loop(self) -> None:
+        """Every ``_SWEEP_INTERVAL_SEC``: close each stream's open batch behind
+        an event and check the batches whose event has completed, so the last
+        transfers of a burst are checked without waiting for the next burst."""
+        while not self._sweep_stop.wait(_SWEEP_INTERVAL_SEC):
+            try:
+                with self._submissions_lock:
+                    for st in self._submissions.values():
+                        if st.stream is not None and (st.uncommitted or st.inflight):
+                            with torch_dev.device(st.stream.device):
+                                self._checkpoint_submissions_locked(st, st.stream)
+                    self._report_checked_locked()
+            except Exception as e:
+                logger.warning("GDSContext: slab sweep: %s", e)
 
 
 @functools.cache
