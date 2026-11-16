@@ -51,6 +51,41 @@ _METADATA_MAX_SIZE = 4096  # reserve 4K for metadata.
 _DEFAULT_THREAD_COUNT = 4
 
 
+class _OpenDSFile:
+    """cufile.CuFile's read/write/context-manager surface over opends.OpenDSFile.
+
+    OpenDS next names the blocking calls read_sync/write_sync; the PR #18
+    binding names them read/write. Both take (buf, size, file_offset,
+    dev_offset) and return the byte count.
+    """
+
+    def __init__(
+        self, path: str, flags: str = "r", use_direct_io: Optional[bool] = None
+    ) -> None:
+        # Third Party
+        import opends
+
+        self._f = opends.OpenDSFile(path, flags, use_direct_io=use_direct_io)
+        self._read = getattr(self._f, "read_sync", None) or self._f.read
+        self._write = getattr(self._f, "write_sync", None) or self._f.write
+
+    def read(
+        self, buf: ctypes.c_void_p, size: int, file_offset: int = 0, dev_offset: int = 0
+    ) -> int:
+        return self._read(buf, size, file_offset=file_offset, dev_offset=dev_offset)
+
+    def write(
+        self, buf: ctypes.c_void_p, size: int, file_offset: int = 0, dev_offset: int = 0
+    ) -> int:
+        return self._write(buf, size, file_offset=file_offset, dev_offset=dev_offset)
+
+    def __enter__(self) -> "_OpenDSFile":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._f.close()
+
+
 class UnsupportedMetadataVersion(Exception):
     pass
 
@@ -305,16 +340,18 @@ class GdsBackend(AllocatorBackendInterface):
                 # OpenDS (vendor-neutral direct storage). The provider .so is
                 # selected at import via OPENDS_BACKEND/OPENDS_LIBRARY (gds =
                 # cuFile passthrough; aisio = userspace NVMe over qublk/HOMI).
-                # OpenDSFile mirrors cufile.CuFile's read/write signatures;
-                # there is no driver object — the driver opens on the first
-                # register_buffer/OpenDSFile and closes when the last releases.
+                # OpenDS next has an explicit, counted Driver (as CuFileDriver);
+                # the PR #18 binding has none and opens the driver on the first
+                # register_buffer/OpenDSFile.
                 # Third Party
                 import opends
 
                 self.cudart = None
                 self.gds_module = opends
-                self._gds_file_cls = opends.OpenDSFile
-                self._gds_driver = None
+                self._gds_file_cls = _OpenDSFile
+                self._gds_driver = (
+                    opends.Driver() if hasattr(opends, "Driver") else None
+                )
             else:
                 raise ValueError(f"Unsupported gds_backend '{self.gds_backend}'")
         else:
@@ -325,9 +362,10 @@ class GdsBackend(AllocatorBackendInterface):
 
         self.use_direct_io = False
         if self.gds_backend == "opends":
-            # None = defer to the provider's own requirement (the opends gds
-            # passthrough needs O_DIRECT, aisio/ref do not). An explicit
-            # use_direct_io in extra_config below still overrides this.
+            # None = the binding's default: O_DIRECT on OpenDS next; on the
+            # PR #18 binding the provider's own requirement (the gds passthrough
+            # needs O_DIRECT, aisio/ref do not). An explicit use_direct_io in
+            # extra_config below still overrides this.
             self.use_direct_io = None
 
         # Values for retrying allocations and loads in case of failures potentially

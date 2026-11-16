@@ -2695,17 +2695,26 @@ class OpenDSMemoryAllocator(GPUMemoryAllocator):
                 device = "cpu:0"
         super().__init__(size, device, align_bytes=4096)
         self.base_pointer = self.tensor.data_ptr()
-        # Pins the buffer for DMA and opens the OpenDS driver (which installs
-        # the SIGTERM/SIGINT cleanup backstop that releases the GPU dma-buf).
+        # OpenDS next needs an open Driver before any buffer call (as
+        # cuFileDriverOpen). Drivers are counted, so this one keeps the driver
+        # open for the buffer's lifetime; GdsBackend opens its own after this
+        # allocator exists. The PR #18 binding has no Driver class and opens
+        # the driver on the first register_buffer. Either binding installs the
+        # SIGTERM/SIGINT cleanup backstop that releases the GPU dma-buf.
+        self._driver = opends.Driver() if hasattr(opends, "Driver") else None
+        # Pins the buffer for DMA.
         opends.register_buffer(self.base_pointer, size)
 
     def __del__(self):
         # Guard partially-constructed instances: __del__ runs even when
-        # __init__ raised before _opends/base_pointer were assigned.
+        # __init__ raised before _opends/base_pointer/_driver were assigned.
         opends = getattr(self, "_opends", None)
         base = getattr(self, "base_pointer", None)
         if opends is not None and base is not None:
             opends.deregister_buffer(base)
+        driver = getattr(self, "_driver", None)
+        if driver is not None:
+            driver.close()
 
     def __str__(self):
         return "OpenDSMemoryAllocator"
