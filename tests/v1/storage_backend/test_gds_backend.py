@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.parse
 
 # Third Party
@@ -116,6 +117,54 @@ def gds_backend(temp_gds_path, async_loop):
         metadata=metadata,
         dst_device="cuda:0",
     )
+
+
+@pytest.mark.parametrize("prewrite", [False, True])
+def test_save_gds_prewrite(temp_gds_path, prewrite):
+    """With gds_prewrite the chunk file holds header + data-sized zeros, on
+    disk, when the GPU write opens it; without, only the header."""
+    seen = {}
+
+    class RecordingFile:
+        def __init__(self, path, flags, use_direct_io=None):
+            seen["flags"] = flags
+            seen["size_at_open"] = os.path.getsize(path)
+            with open(path, "rb") as f:
+                seen["body_at_open"] = f.read()[4096:]
+
+        def write(self, addr, size, file_offset=0, dev_offset=0):
+            seen["write"] = (size, file_offset)
+            return size
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    backend = types.SimpleNamespace(
+        prewrite=prewrite,
+        gds_module=object(),
+        _gds_file_cls=RecordingFile,
+        use_direct_io=None,
+        cudart=None,
+    )
+    kv_chunk = torch.zeros(512, dtype=torch.bfloat16)
+    path = os.path.join(temp_gds_path, "chunk" + _DATA_FILE_SUFFIX)
+    with mock.patch("os.fsync") as fsync:
+        GdsBackend._save_gds(
+            backend, path, ".tmp", kv_chunk, MemoryFormat.KV_2LTD, 0x1000, 0
+        )
+    assert seen["flags"] == "r+"
+    assert seen["write"] == (kv_chunk.nbytes, 4096)
+    assert os.path.exists(path) and not os.path.exists(path + ".tmp")
+    if prewrite:
+        assert seen["size_at_open"] == 4096 + kv_chunk.nbytes
+        assert seen["body_at_open"] == bytes(kv_chunk.nbytes)
+        fsync.assert_called_once()
+    else:
+        assert seen["size_at_open"] == 4096
+        fsync.assert_not_called()
 
 
 @pytest.mark.skipif(

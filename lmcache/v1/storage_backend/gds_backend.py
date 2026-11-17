@@ -360,6 +360,10 @@ class GdsBackend(AllocatorBackendInterface):
             self._gds_file_cls = None
             self.cudart = ctypes.CDLL("libcudart.so")
 
+        # extra_config gds_prewrite: a chunk file is written through with zeros
+        # and flushed before the GPU write, which then overwrites written
+        # extents in place (the only write OpenDS aisio moves by DMA).
+        self.prewrite = False
         self.use_direct_io = False
         if self.gds_backend == "opends":
             # None = the binding's default: O_DIRECT on OpenDS next; on the
@@ -381,6 +385,7 @@ class GdsBackend(AllocatorBackendInterface):
             use_direct_io = get_extra_config_bool("use_direct_io", config)
             if use_direct_io is not None:
                 self.use_direct_io = use_direct_io
+            self.prewrite = bool(get_extra_config_bool("gds_prewrite", config))
 
         for p in self.gds_paths:
             os.makedirs(p, exist_ok=True)
@@ -1040,6 +1045,10 @@ class GdsBackend(AllocatorBackendInterface):
         try:
             with open(tmp_path, "wb") as f:
                 f.write(metadata)
+                if self.prewrite and self.gds_module:
+                    f.write(bytes(kv_chunk.nbytes))
+                    f.flush()
+                    os.fsync(f.fileno())
             if self.gds_module:
                 with self._gds_file_cls(
                     tmp_path, "r+", use_direct_io=self.use_direct_io
