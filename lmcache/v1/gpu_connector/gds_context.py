@@ -22,6 +22,12 @@ enqueued on the current CUDA stream and the call returns, cuFileReadAsync /
 opends read_stream) or ``sync`` (the current stream is synchronized, then one
 blocking transfer under a lock, cuFileRead / opends read_sync).
 
+LMCACHE_MP_GDS_SLAB_PREWRITE, the slab's initial state: ``0`` (default: the
+slab is preallocated, its extents unwritten until a chunk lands on them) or
+``1`` (the slab is written through with zeros once at startup, so every chunk
+write is an in-place overwrite of written extents; the OpenDS aisio provider
+moves only such a write GPU to NVMe by DMA).
+
 Both libraries implement both submissions through the same code below, so a
 comparison of two libraries holds the submission fixed and a comparison of two
 submissions holds the library fixed.
@@ -57,6 +63,11 @@ if _PROVIDER not in ("cufile", "opends"):
 _SUBMIT = os.environ.get("LMCACHE_MP_GDS_SUBMIT", "stream").strip().lower()
 if _SUBMIT not in ("stream", "sync"):
     raise ValueError(f"LMCACHE_MP_GDS_SUBMIT={_SUBMIT!r}: want stream|sync")
+# 0 | 1 -- whether the slab is written through once at startup
+_PREWRITE_RAW = os.environ.get("LMCACHE_MP_GDS_SLAB_PREWRITE", "0").strip()
+if _PREWRITE_RAW not in ("0", "1"):
+    raise ValueError(f"LMCACHE_MP_GDS_SLAB_PREWRITE={_PREWRITE_RAW!r}: want 0|1")
+_PREWRITE = _PREWRITE_RAW == "1"
 # cuFileStreamRegister flags of the cufile wrapper (fixed size and offsets),
 # given to the OpenDS stream registration too
 _STREAM_FLAGS = 0x7
@@ -66,6 +77,8 @@ _CUFILE_ALIGNMENT = 4096
 # A single cuFileBufRegister/DMA is capped at 16 MiB; larger buffers and chunks
 # are registered and transferred in <=16 MiB regions.
 _MAX_CUFILE_REGION = 16 * 1024 * 1024
+# Bytes per write() of the startup write-through (LMCACHE_MP_GDS_SLAB_PREWRITE=1).
+_PREWRITE_BLOCK = 16 * 1024 * 1024
 # cuFile submissions to accumulate before recording a completion event and
 # draining finished ones (keeps the live submission set bounded).
 _SUBMISSION_CHECKPOINT_EVERY = 64
@@ -351,6 +364,14 @@ class GDSContext:
         )
         try:
             os.posix_fallocate(creator_fd, 0, self._slab_size)
+            if _PREWRITE:
+                # Before the provider registers the file: it maps the extents then.
+                _write_through(creator_fd, self._slab_size)
+                logger.info(
+                    "GDSContext: slab written through once (%.1f GiB of zeros), "
+                    "every chunk write is an overwrite of written extents",
+                    self._slab_size / (1 << 30),
+                )
         finally:
             os.close(creator_fd)
         if _PROVIDER == "opends":
@@ -666,6 +687,28 @@ class GDSContext:
                     self._report_checked_locked()
             except Exception as e:
                 logger.warning("GDSContext: slab sweep: %s", e)
+
+
+def _write_through(fd: int, size: int) -> None:
+    """Write zeros over the first ``size`` bytes of a file and flush them to the device.
+
+    Turns preallocated (unwritten) extents into written ones, and drops the
+    zeros from the page cache afterwards: the slab is read and written with
+    direct I/O only.
+
+    Args:
+        fd: A writable descriptor of the file, opened without ``O_DIRECT``.
+        size: Number of bytes to write, from offset 0.
+
+    Raises:
+        OSError: If a write or the flush fails (for example, no space left).
+    """
+    block = bytes(min(_PREWRITE_BLOCK, size))
+    offset = 0
+    while offset < size:
+        offset += os.pwrite(fd, block[: size - offset], offset)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, size, os.POSIX_FADV_DONTNEED)
 
 
 @functools.cache

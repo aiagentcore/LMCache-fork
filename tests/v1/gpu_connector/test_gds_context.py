@@ -24,6 +24,7 @@ from lmcache.v1.distributed.config import GdsL1Config
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.memory_manager import GDSL1MemoryManager
 from lmcache.v1.gpu_connector import _cufile_async as ca
+from lmcache.v1.gpu_connector import gds_context as gds_context_module
 from lmcache.v1.gpu_connector.gds_context import (
     GDSContext,
     SlabDirection,
@@ -62,6 +63,46 @@ class TestSingleton:
         ctx = initialize_gds_context(None)
         assert ctx is get_gds_context()
         assert ctx.initialized is False
+
+
+class TestSlabPrewrite:
+    """LMCACHE_MP_GDS_SLAB_PREWRITE: the slab's blocks at startup (no cuFile)."""
+
+    _SIZE = 3 * 1024 * 1024 + 4096
+
+    def _create_slab(self, monkeypatch, tmp_path, prewrite: bool) -> str:
+        def stop_before_provider(fd):
+            raise RuntimeError("no cuFile in this test")
+
+        monkeypatch.setattr(gds_context_module, "_PROVIDER", "cufile")
+        monkeypatch.setattr(gds_context_module, "_PREWRITE", prewrite)
+        monkeypatch.setattr(gds_context_module, "_PREWRITE_BLOCK", 1024 * 1024)
+        monkeypatch.setattr(
+            "cufile.bindings.cuFileHandleRegister", stop_before_provider, raising=False
+        )
+        config = GdsL1Config(
+            file_location=str(tmp_path), size_in_bytes=self._SIZE, use_direct_io=False
+        )
+        with pytest.raises(Exception):
+            GDSContext().initialize(config)
+        return os.path.join(str(tmp_path), "lmcache_gds_slab.bin")
+
+    def test_prewrite_writes_every_byte(self, monkeypatch, tmp_path):
+        path = self._create_slab(monkeypatch, tmp_path, prewrite=True)
+        assert os.path.getsize(path) == self._SIZE
+        with open(path, "rb") as f:
+            assert f.read() == bytes(self._SIZE)
+        # no hole and no unwritten extent: data from offset 0 to the end
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            assert os.lseek(fd, 0, os.SEEK_DATA) == 0
+            assert os.lseek(fd, 0, os.SEEK_HOLE) == self._SIZE
+        finally:
+            os.close(fd)
+
+    def test_default_only_preallocates(self, monkeypatch, tmp_path):
+        path = self._create_slab(monkeypatch, tmp_path, prewrite=False)
+        assert os.path.getsize(path) == self._SIZE
 
 
 class TestRegisterGpuBuffer:
