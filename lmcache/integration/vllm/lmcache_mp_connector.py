@@ -191,6 +191,9 @@ class LMCacheMPRequestTracker:
     # avoid saving tokens whose KV has not been computed yet.
     num_scheduled_tokens: int = 0
 
+    # vLLM's num_computed_tokens + tokens scheduled in the latest step.
+    num_engine_computed_tokens: int = 0
+
     # Number of tokens stored will be initialized when lookup the external
     # hit tokens and will be updated when processing new requests and cached
     # requests.
@@ -210,6 +213,7 @@ class LMCacheMPRequestTracker:
         self.cache_salt: str = request.cache_salt or ""
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
+        self.num_engine_computed_tokens = 0
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
@@ -239,6 +243,12 @@ class LMCacheMPRequestTracker:
     ####
     def increase_num_scheduled_tokens(self, num_new_tokens: int):
         self.num_scheduled_tokens += num_new_tokens
+
+    def update_num_engine_computed_tokens(
+        self, num_computed_tokens: int, num_new_tokens: int
+    ):
+        """Record vLLM's computed-prefix end for the current step."""
+        self.num_engine_computed_tokens = num_computed_tokens + num_new_tokens
 
     def increase_num_stored_tokens(self, num_new_tokens: int):
         """Increase the number of stored tokens for the current request
@@ -330,8 +340,13 @@ class LMCacheMPRequestMetadata:
         #   low and silently skip the APC-hit tokens that fall between the
         #   two values, causing under-storing.  Taking the max ensures we
         #   always use the tighter (larger) of the two hit counts.
-        computed_tokens = tracker.num_scheduled_tokens + max(
-            tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens
+        #
+        # Lower bound: vLLM's real computed position. Partial hybrid hits
+        # (e.g. DCP) start past the floored vLLM hit.
+        computed_tokens = max(
+            tracker.num_scheduled_tokens
+            + max(tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens),
+            tracker.num_engine_computed_tokens,
         )
         # Each group covers ``len(block_ids) * tokens_per_block`` tokens; the
         # storable prefix is bounded by the least-covered group (e.g.
@@ -1139,6 +1154,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.update_num_engine_computed_tokens(
+                new_request.num_computed_tokens, num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
@@ -1168,6 +1186,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # stay consistent with _process_new_requests.
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.update_num_engine_computed_tokens(
+                cached_reqs.num_computed_tokens[idx], num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
